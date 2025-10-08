@@ -1,4 +1,20 @@
 {
+  "compilerOptions": {
+    "target": "ES2020",
+    "lib": ["DOM", "DOM.Iterable", "ES2020"],
+    "module": "ESNext",
+    "skipLibCheck": true,
+    "esModuleInterop": true,
+    "allowSyntheticDefaultImports": true,
+    "strict": true,
+    "forceConsistentCasingInFileNames": true,
+    "moduleResolution": "Bundler",
+    "resolveJsonModule": true,
+    "isolatedModules": false,
+    "noEmit": true,
+    "useDefineForClassFields": false,
+    "verbatimModuleSyntax": false
+  },
   "files": [],
   "references": [
     { "path": "./tsconfig.app.json" },

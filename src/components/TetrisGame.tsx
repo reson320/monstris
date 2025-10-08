@@ -1,88 +1,15 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from 'react'
+import { getLevelRequirement, getStageDefinition } from '../data/stages'
+import { SKILL_DEFINITIONS, type SkillId, type SkillLevels } from '../data/skills'
+import { BOARD_HEIGHT, BOARD_WIDTH, canMove, clearCompletedLines, createEmptyBoard, createPiece, getTSpinType, mergePieceToBoard } from '../game/board'
+import type { ActivePiece, Board, TetrominoType } from '../game/types'
+import { COLORS, createShuffledBag, getRotationMatrix } from '../game/tetromino'
+import { attemptRotation as applyRotation } from '../game/rotation'
+import { calculateDamage } from '../game/battle'
+import { gameEventBus } from '../game/events'
 
-const BOARD_WIDTH = 10
-const BOARD_HEIGHT = 20
-const LINES_PER_LEVEL = 10
-const MONSTER_BASE_HP = 18
 const LOCK_DELAY = 200
-const BACK_TO_BACK_BONUS_DAMAGE = 2
-const T_SPIN_CORNER_OFFSETS: Array<[number, number]> = [
-  [0, 0],
-  [2, 0],
-  [0, 2],
-  [2, 2],
-]
-
-const MONSTER_DATA = [
-  { name: '史萊姆', maxHP: MONSTER_BASE_HP, color: '#22d3ee', accent: '#38bdf8', figure: 'slime' },
-  { name: '森林巨蛛', maxHP: MONSTER_BASE_HP + 8, color: '#84cc16', accent: '#a3e635', figure: 'spider' },
-  { name: '熔岩巨人', maxHP: MONSTER_BASE_HP + 16, color: '#f97316', accent: '#facc15', figure: 'golem' },
-  { name: '風暴龍', maxHP: MONSTER_BASE_HP + 24, color: '#60a5fa', accent: '#a855f7', figure: 'dragon' },
-  { name: '虛空之主', maxHP: MONSTER_BASE_HP + 32, color: '#8b5cf6', accent: '#f472b6', figure: 'void' },
-]
-
-const getMonsterMaxHP = (stage: number, loop: number) => MONSTER_DATA[stage].maxHP + loop * 28
-
-const getLevelRequirement = (level: number) => 30 + (level - 1) * 18
-
-type SkillId =
-  | 'flatAttack'
-  | 'singleLineBonus'
-  | 'tetrisBonus'
-  | 'comboBonus'
-  | 'chargedStrike'
-  | 'steadyMind'
-  | 'flameStrike'
-
-interface SkillDefinition {
-  id: SkillId
-  name: string
-  description: string
-}
-
-const createInitialSkillLevels = () => ({
-  flatAttack: 0,
-  singleLineBonus: 0,
-  tetrisBonus: 0,
-  comboBonus: 0,
-  chargedStrike: 0,
-  steadyMind: 0,
-  flameStrike: 0,
-})
-
-type SkillLevels = ReturnType<typeof createInitialSkillLevels>
-
-const SKILL_DEFINITIONS: SkillDefinition[] = [
-  { id: 'flatAttack', name: '力量淬鍊', description: '所有攻擊傷害 +1' },
-  { id: 'singleLineBonus', name: '精準切削', description: '消一行時額外 +1 傷害' },
-  { id: 'tetrisBonus', name: '絕地破壞', description: '消四行時額外 +2 傷害' },
-  { id: 'comboBonus', name: '連擊覺醒', description: '每次連擊追加當前連擊數的傷害' },
-  { id: 'chargedStrike', name: '蓄力重擊', description: '累積 3 次單行消除後，下次攻擊額外造成 +3 傷害' },
-  { id: 'steadyMind', name: '穩固心神', description: '每成功放置 5 個方塊，立即對怪物造成 3 點傷害' },
-  { id: 'flameStrike', name: '火焰打擊', description: '擊中怪物後附加 2 回合灼燒，灼燒期間每次消除額外 +3 傷害' },
-]
-
-type TetrominoType = 'I' | 'O' | 'T' | 'J' | 'L' | 'S' | 'Z'
-
-type Cell = string | null
-type Board = Cell[][]
-
-interface PiecePosition {
-  x: number
-  y: number
-}
-
-interface ActivePiece {
-  type: TetrominoType
-  rotationIndex: number
-  position: PiecePosition
-}
-
-interface KickTest {
-  x: number
-  y: number
-}
 
 interface ControlSettings {
   das: number
@@ -92,504 +19,63 @@ interface ControlSettings {
   gravity: number
 }
 
-interface MonsterState {
-  stage: number
-  loop: number
-  hp: number
-}
-
 const DEFAULT_SETTINGS: ControlSettings = {
   das: 167,
   arr: 33,
   dcd: 33,
-  sdf: 6,
+  sdf: 30,
   gravity: 750,
 }
 
-const COLORS: Record<TetrominoType, string> = {
-  I: '#60a5fa',
-  O: '#facc15',
-  T: '#c084fc',
-  J: '#38bdf8',
-  L: '#fb923c',
-  S: '#4ade80',
-  Z: '#f87171',
-}
+const createBagQueue = (): TetrominoType[] => createShuffledBag()
 
-const BASE_SHAPES: Record<TetrominoType, number[][]> = {
-  I: [
-    [0, 0, 0, 0],
-    [1, 1, 1, 1],
-    [0, 0, 0, 0],
-    [0, 0, 0, 0],
-  ],
-  O: [
-    [0, 1, 1, 0],
-    [0, 1, 1, 0],
-    [0, 0, 0, 0],
-    [0, 0, 0, 0],
-  ],
-  T: [
-    [0, 1, 0, 0],
-    [1, 1, 1, 0],
-    [0, 0, 0, 0],
-    [0, 0, 0, 0],
-  ],
-  J: [
-    [1, 0, 0, 0],
-    [1, 1, 1, 0],
-    [0, 0, 0, 0],
-    [0, 0, 0, 0],
-  ],
-  L: [
-    [0, 0, 1, 0],
-    [1, 1, 1, 0],
-    [0, 0, 0, 0],
-    [0, 0, 0, 0],
-  ],
-  S: [
-    [0, 1, 1, 0],
-    [1, 1, 0, 0],
-    [0, 0, 0, 0],
-    [0, 0, 0, 0],
-  ],
-  Z: [
-    [1, 1, 0, 0],
-    [0, 1, 1, 0],
-    [0, 0, 0, 0],
-    [0, 0, 0, 0],
-  ],
-}
-
-const KICK_TABLE_STANDARD: KickTest[] = [
-  { x: 0, y: 0 },
-  { x: -1, y: 0 },
-  { x: -1, y: -1 },
-  { x: 0, y: 2 },
-  { x: -1, y: 2 },
-]
-
-const KICK_TABLE_I: KickTest[] = [
-  { x: 0, y: 0 },
-  { x: -2, y: 0 },
-  { x: 1, y: 0 },
-  { x: -2, y: -1 },
-  { x: 1, y: 2 },
-]
-
-const KICK_TABLE_STANDARD_CCW: KickTest[] = [
-  { x: 0, y: 0 },
-  { x: 1, y: 0 },
-  { x: 1, y: -1 },
-  { x: 0, y: 2 },
-  { x: 1, y: 2 },
-]
-
-const KICK_TABLE_I_CCW: KickTest[] = [
-  { x: 0, y: 0 },
-  { x: -1, y: 0 },
-  { x: 2, y: 0 },
-  { x: -1, y: 2 },
-  { x: 2, y: -1 },
-]
-
-const KICK_TABLE_180: KickTest[] = [
-  { x: 0, y: 0 },
-  { x: 1, y: 0 },
-  { x: -1, y: 0 },
-  { x: 0, y: -1 },
-  { x: 1, y: -1 },
-  { x: -1, y: -1 },
-]
-
-const TETROMINO_PIVOTS: Record<TetrominoType, { x: number; y: number }> = {
-  I: { x: 1.5, y: 1.5 },
-  O: { x: 1.5, y: 1.5 },
-  T: { x: 1, y: 1 },
-  J: { x: 1, y: 1 },
-  L: { x: 1, y: 1 },
-  S: { x: 1, y: 1 },
-  Z: { x: 1, y: 1 },
-}
-
-const rotateMatrix = (matrix: number[][], pivot: { x: number; y: number }): number[][] => {
-  const size = matrix.length
-  const rotated = Array.from({ length: size }, () => Array(size).fill(0))
-
-  for (let y = 0; y < size; y += 1) {
-    for (let x = 0; x < size; x += 1) {
-      if (!matrix[y][x]) continue
-
-      const offsetX = x - pivot.x
-      const offsetY = y - pivot.y
-      const rotatedX = pivot.x - offsetY
-      const rotatedY = pivot.y + offsetX
-
-      const targetX = Math.round(rotatedX)
-      const targetY = Math.round(rotatedY)
-
-      if (targetX >= 0 && targetX < size && targetY >= 0 && targetY < size) {
-        rotated[targetY][targetX] = matrix[y][x]
-      }
-    }
+const calculateTotalExpFromState = (level: number, exp: number) => {
+  let total = exp
+  for (let currentLevel = 1; currentLevel < level; currentLevel += 1) {
+    total += getLevelRequirement(currentLevel)
   }
-
-  return rotated
+  return total
 }
 
-const generateRotations = (type: TetrominoType, base: number[][]): number[][][] => {
-  const pivot = TETROMINO_PIVOTS[type]
-  const rotations = [base]
-  for (let i = 0; i < 3; i += 1) {
-    rotations.push(rotateMatrix(rotations[i], pivot))
+const resolveLevelFromTotalExp = (totalExp: number) => {
+  let level = 1
+  let exp = 0
+  while (totalExp >= getLevelRequirement(level)) {
+    totalExp -= getLevelRequirement(level)
+    level += 1
   }
-  return rotations
+  exp = totalExp
+  return { level, exp }
 }
 
-const TETROMINO_ROTATIONS: Record<TetrominoType, number[][][]> = {
-  I: generateRotations('I', BASE_SHAPES.I),
-  O: generateRotations('O', BASE_SHAPES.O),
-  T: generateRotations('T', BASE_SHAPES.T),
-  J: generateRotations('J', BASE_SHAPES.J),
-  L: generateRotations('L', BASE_SHAPES.L),
-  S: generateRotations('S', BASE_SHAPES.S),
-  Z: generateRotations('Z', BASE_SHAPES.Z),
+interface TetrisGameProps {
+  stageId: number
+  onStageCleared: (stageId: number, playerLevel: number, playerExp: number, pendingSkillIds?: SkillId[]) => void
+  onExitStage: () => void
+  onRequestNextStage: (stageId: number) => void
+  initialPlayerLevel: number
+  initialPlayerExp: number
+  onPlayerProgress: (playerLevel: number, playerExp: number, pendingSkillIds?: SkillId[]) => void
+  totalStages: number
+  skillLevels: SkillLevels
+  onRequestSkillSelection: (skillIds: SkillId[]) => void
+  skillSelectionActive: boolean
 }
 
-const SRS_KICKS_STANDARD: Record<string, KickTest[]> = {
-  '0>1': [
-    { x: 0, y: 0 },
-    { x: -1, y: 0 },
-    { x: -1, y: -1 },
-    { x: 0, y: 2 },
-    { x: -1, y: 2 },
-  ],
-  '1>0': [
-    { x: 0, y: 0 },
-    { x: 1, y: 0 },
-    { x: 1, y: 1 },
-    { x: 0, y: -2 },
-    { x: 1, y: -2 },
-  ],
-  '1>2': [
-    { x: 0, y: 0 },
-    { x: 1, y: 0 },
-    { x: 1, y: 1 },
-    { x: 0, y: -2 },
-    { x: 1, y: -2 },
-  ],
-  '2>1': [
-    { x: 0, y: 0 },
-    { x: -1, y: 0 },
-    { x: -1, y: -1 },
-    { x: 0, y: 2 },
-    { x: -1, y: 2 },
-  ],
-  '2>3': [
-    { x: 0, y: 0 },
-    { x: 1, y: 0 },
-    { x: 1, y: -1 },
-    { x: 0, y: 2 },
-    { x: 1, y: 2 },
-  ],
-  '3>2': [
-    { x: 0, y: 0 },
-    { x: -1, y: 0 },
-    { x: -1, y: 1 },
-    { x: 0, y: -2 },
-    { x: -1, y: -2 },
-  ],
-  '3>0': [
-    { x: 0, y: 0 },
-    { x: -1, y: 0 },
-    { x: -1, y: 1 },
-    { x: 0, y: -2 },
-    { x: -1, y: -2 },
-  ],
-  '0>3': [
-    { x: 0, y: 0 },
-    { x: 1, y: 0 },
-    { x: 1, y: -1 },
-    { x: 0, y: 2 },
-    { x: 1, y: 2 },
-  ],
-}
-
-const SRS_KICKS_J: Record<string, KickTest[]> = {
-  '0>1': SRS_KICKS_STANDARD['0>1'].map((kick) => ({ ...kick })),
-  '1>0': SRS_KICKS_STANDARD['1>0'].map((kick) => ({ ...kick })),
-  '1>2': SRS_KICKS_STANDARD['1>2'].map((kick) => ({ ...kick })),
-  '2>1': SRS_KICKS_STANDARD['2>1'].map((kick) => ({ ...kick })),
-  '2>3': SRS_KICKS_STANDARD['2>3'].map((kick) => ({ ...kick })),
-  '3>2': SRS_KICKS_STANDARD['3>2'].map((kick) => ({ ...kick })),
-  '3>0': SRS_KICKS_STANDARD['3>0'].map((kick) => ({ ...kick })),
-  '0>3': SRS_KICKS_STANDARD['0>3'].map((kick) => ({ ...kick })),
-  '0>2': KICK_TABLE_180.map((kick) => ({ ...kick })),
-  '2>0': KICK_TABLE_180.map((kick) => ({ ...kick })),
-  '1>3': KICK_TABLE_180.map((kick) => ({ ...kick })),
-  '3>1': KICK_TABLE_180.map((kick) => ({ ...kick })),
-}
-
-const SRS_KICKS_L: Record<string, KickTest[]> = {
-  '0>1': SRS_KICKS_STANDARD['0>1'].map((kick) => ({ ...kick })),
-  '1>0': SRS_KICKS_STANDARD['1>0'].map((kick) => ({ ...kick })),
-  '1>2': SRS_KICKS_STANDARD['1>2'].map((kick) => ({ ...kick })),
-  '2>1': SRS_KICKS_STANDARD['2>1'].map((kick) => ({ ...kick })),
-  '2>3': SRS_KICKS_STANDARD['2>3'].map((kick) => ({ ...kick })),
-  '3>2': SRS_KICKS_STANDARD['3>2'].map((kick) => ({ ...kick })),
-  '3>0': SRS_KICKS_STANDARD['3>0'].map((kick) => ({ ...kick })),
-  '0>3': SRS_KICKS_STANDARD['0>3'].map((kick) => ({ ...kick })),
-  '0>2': KICK_TABLE_180.map((kick) => ({ ...kick })),
-  '2>0': KICK_TABLE_180.map((kick) => ({ ...kick })),
-  '1>3': KICK_TABLE_180.map((kick) => ({ ...kick })),
-  '3>1': KICK_TABLE_180.map((kick) => ({ ...kick })),
-}
-
-const SRS_KICKS_I: Record<string, KickTest[]> = {
-  '0>1': [
-    { x: 0, y: 0 },
-    { x: -2, y: 0 },
-    { x: 1, y: 0 },
-    { x: -2, y: -1 },
-    { x: 1, y: 2 },
-  ],
-  '1>0': [
-    { x: 0, y: 0 },
-    { x: 2, y: 0 },
-    { x: -1, y: 0 },
-    { x: 2, y: -1 },
-    { x: -1, y: 2 },
-  ],
-  '1>2': [
-    { x: 0, y: 0 },
-    { x: -1, y: 0 },
-    { x: 2, y: 0 },
-    { x: -1, y: -2 },
-    { x: 2, y: 1 },
-  ],
-  '2>1': [
-    { x: 0, y: 0 },
-    { x: 1, y: 0 },
-    { x: -2, y: 0 },
-    { x: 1, y: 2 },
-    { x: -2, y: -1 },
-  ],
-  '2>3': [
-    { x: 0, y: 0 },
-    { x: 2, y: 0 },
-    { x: -1, y: 0 },
-    { x: 2, y: -1 },
-    { x: -1, y: 2 },
-  ],
-  '3>2': [
-    { x: 0, y: 0 },
-    { x: -2, y: 0 },
-    { x: 1, y: 0 },
-    { x: -2, y: 1 },
-    { x: 1, y: -2 },
-  ],
-  '3>0': [
-    { x: 0, y: 0 },
-    { x: -1, y: 0 },
-    { x: 2, y: 0 },
-    { x: -1, y: -2 },
-    { x: 2, y: 1 },
-  ],
-  '0>3': [
-    { x: 0, y: 0 },
-    { x: 1, y: 0 },
-    { x: -2, y: 0 },
-    { x: 1, y: 2 },
-    { x: -2, y: -1 },
-  ],
-}
-
-const SRS_KICKS_180: Record<string, KickTest[]> = {
-  '0>2': [
-    { x: 0, y: 0 },
-    { x: -1, y: 0 },
-    { x: 1, y: 0 },
-    { x: 0, y: 1 },
-    { x: -1, y: 1 },
-    { x: 1, y: 1 },
-    { x: 0, y: -1 },
-  ],
-  '1>3': [
-    { x: 0, y: 0 },
-    { x: 0, y: -1 },
-    { x: 0, y: 1 },
-    { x: 1, y: 0 },
-    { x: 1, y: -1 },
-    { x: 1, y: 1 },
-    { x: -1, y: 0 },
-  ],
-  '2>0': [
-    { x: 0, y: 0 },
-    { x: 1, y: 0 },
-    { x: -1, y: 0 },
-    { x: 0, y: -1 },
-    { x: 1, y: -1 },
-    { x: -1, y: -1 },
-    { x: 0, y: 1 },
-  ],
-  '3>1': [
-    { x: 0, y: 0 },
-    { x: 0, y: 1 },
-    { x: 0, y: -1 },
-    { x: -1, y: 0 },
-    { x: -1, y: 1 },
-    { x: -1, y: -1 },
-    { x: 1, y: 0 },
-  ],
-}
-
-const SRS_KICKS: Record<TetrominoType, Record<string, KickTest[]>> = {
-  I: { ...SRS_KICKS_I, ...SRS_KICKS_180 },
-  O: {
-    '0>1': [{ x: 0, y: 0 }],
-    '1>0': [{ x: 0, y: 0 }],
-    '1>2': [{ x: 0, y: 0 }],
-    '2>1': [{ x: 0, y: 0 }],
-    '2>3': [{ x: 0, y: 0 }],
-    '3>2': [{ x: 0, y: 0 }],
-    '3>0': [{ x: 0, y: 0 }],
-    '0>3': [{ x: 0, y: 0 }],
-    '0>2': [{ x: 0, y: 0 }],
-    '2>0': [{ x: 0, y: 0 }],
-    '1>3': [{ x: 0, y: 0 }],
-    '3>1': [{ x: 0, y: 0 }],
-  },
-  T: { ...SRS_KICKS_STANDARD, ...SRS_KICKS_180 },
-  J: SRS_KICKS_J,
-  L: SRS_KICKS_L,
-  S: { ...SRS_KICKS_STANDARD, ...SRS_KICKS_180 },
-  Z: { ...SRS_KICKS_STANDARD, ...SRS_KICKS_180 },
-}
-
-const createEmptyBoard = (): Board =>
-  Array.from({ length: BOARD_HEIGHT }, () => Array<Cell>(BOARD_WIDTH).fill(null))
-
-const shuffle = <T,>(array: T[]): T[] => {
-  const copy = [...array]
-  for (let i = copy.length - 1; i > 0; i -= 1) {
-    const j = Math.floor(Math.random() * (i + 1))
-    ;[copy[i], copy[j]] = [copy[j], copy[i]]
-  }
-  return copy
-}
-
-const createBagQueue = (): TetrominoType[] => {
-  const bag = shuffle(Object.keys(BASE_SHAPES) as TetrominoType[])
-  return bag
-}
-
-const getRotationMatrix = (type: TetrominoType, rotationIndex: number): number[][] =>
-  TETROMINO_ROTATIONS[type][rotationIndex % TETROMINO_ROTATIONS[type].length]
-
-const createPiece = (type: TetrominoType): ActivePiece => ({
-  type,
-  rotationIndex: 0,
-  position: {
-    x: Math.floor(BOARD_WIDTH / 2) - 2,
-    y: -1,
-  },
-})
-
-const canMove = (
-  piece: ActivePiece,
-  board: Board,
-  offsetX: number,
-  offsetY: number,
-  rotationIndex = piece.rotationIndex,
-): boolean => {
-  const matrix = getRotationMatrix(piece.type, rotationIndex)
-
-  for (let y = 0; y < matrix.length; y += 1) {
-    for (let x = 0; x < matrix[y].length; x += 1) {
-      if (!matrix[y][x]) continue
-
-      const newX = piece.position.x + x + offsetX
-      const newY = piece.position.y + y + offsetY
-
-      if (newX < 0 || newX >= BOARD_WIDTH) return false
-      if (newY >= BOARD_HEIGHT) return false
-      if (newY >= 0 && board[newY][newX]) return false
-    }
-  }
-
-  return true
-}
-
-const mergePieceToBoard = (board: Board, piece: ActivePiece): Board => {
-  const matrix = getRotationMatrix(piece.type, piece.rotationIndex)
-  const merged = board.map((row) => [...row])
-
-  for (let y = 0; y < matrix.length; y += 1) {
-    for (let x = 0; x < matrix[y].length; x += 1) {
-      if (!matrix[y][x]) continue
-
-      const boardX = piece.position.x + x
-      const boardY = piece.position.y + y
-
-      if (boardY >= 0 && boardY < BOARD_HEIGHT && boardX >= 0 && boardX < BOARD_WIDTH) {
-        merged[boardY][boardX] = COLORS[piece.type]
-      }
-    }
-  }
-
-  return merged
-}
-
-const clearCompletedLines = (board: Board): { board: Board; clearedLines: number; linesType: number } => {
-  const remaining: Board = []
-  let cleared = 0
-
-  for (let y = 0; y < BOARD_HEIGHT; y += 1) {
-    const row = board[y]
-    if (row.every((cell) => cell !== null)) {
-      cleared += 1
-    } else {
-      remaining.push(row)
-    }
-  }
-
-  while (remaining.length < BOARD_HEIGHT) {
-    remaining.unshift(Array<Cell>(BOARD_WIDTH).fill(null))
-  }
-
-  return { board: remaining, clearedLines: cleared, linesType: cleared }
-}
-
-const getTSpinType = (
-  board: Board,
-  piece: ActivePiece,
-  wasRotated: boolean,
-  clearedLines: number,
-): 'none' | 'mini' | 'double' | 'triple' => {
-  if (!wasRotated || piece.type !== 'T') return 'none'
-
-  const originX = piece.position.x
-  const originY = piece.position.y
-
-  let filledCorners = 0
-  for (const [offsetX, offsetY] of T_SPIN_CORNER_OFFSETS) {
-    const x = originX + offsetX
-    const y = originY + offsetY
-    if (y < 0 || y >= BOARD_HEIGHT || x < 0 || x >= BOARD_WIDTH || board[y][x]) {
-      filledCorners += 1
-    }
-  }
-
-  if (filledCorners < 3) return 'none'
-
-  if (clearedLines >= 3) return 'triple'
-  if (clearedLines === 2) return 'double'
-  if (clearedLines >= 1) return 'mini'
-
-  return 'mini'
-}
-
-const TetrisGame = () => {
+const TetrisGame = ({
+  stageId,
+  onStageCleared,
+  onExitStage,
+  onRequestNextStage,
+  initialPlayerLevel,
+  initialPlayerExp,
+  onPlayerProgress,
+  totalStages,
+  skillLevels,
+  onRequestSkillSelection,
+  skillSelectionActive,
+}: TetrisGameProps) => {
+  const stageDefinition = getStageDefinition(stageId)
   const [board, setBoard] = useState<Board>(() => createEmptyBoard())
   const [currentPiece, setCurrentPiece] = useState<ActivePiece | null>(null)
   const [nextQueue, setNextQueue] = useState<TetrominoType[]>(() => {
@@ -598,21 +84,17 @@ const TetrisGame = () => {
     return [...firstBag, ...secondBag]
   })
   const [upcomingPieceIndex, setUpcomingPieceIndex] = useState(0)
-  const [level, setLevel] = useState(0)
   const [isRunning, setIsRunning] = useState(false)
   const [isGameOver, setIsGameOver] = useState(false)
   const [holdPiece, setHoldPiece] = useState<TetrominoType | null>(null)
   const [hasHeld, setHasHeld] = useState(false)
   const [settings, setSettings] = useState<ControlSettings>(DEFAULT_SETTINGS)
-  const [softDropActive, setSoftDropActive] = useState(false)
-  const [monster, setMonster] = useState<MonsterState>({ stage: 0, loop: 0, hp: getMonsterMaxHP(0, 0) })
-  const [playerLevel, setPlayerLevel] = useState(1)
-  const [playerExp, setPlayerExp] = useState(0)
-  const playerLevelRef = useRef(1)
-  const [skillLevels, setSkillLevels] = useState<SkillLevels>(() => createInitialSkillLevels())
+  const [monsterHP, setMonsterHP] = useState(stageDefinition.maxHP)
+  const [playerLevel, setPlayerLevel] = useState(initialPlayerLevel)
+  const [playerExp, setPlayerExp] = useState(initialPlayerExp)
+  const playerLevelRef = useRef(initialPlayerLevel)
+  const playerTotalExpRef = useRef(calculateTotalExpFromState(initialPlayerLevel, initialPlayerExp))
   const [comboChain, setComboChain] = useState(0)
-  const [pendingSkills, setPendingSkills] = useState<SkillId[]>([])
-  const [isLevelUpMenuVisible, setIsLevelUpMenuVisible] = useState(false)
   const [smashSignal, setSmashSignal] = useState<number | null>(null)
   const [smashBackToBack, setSmashBackToBack] = useState(false)
   const [smashLabel, setSmashLabel] = useState('SMASH!')
@@ -637,16 +119,31 @@ const TetrisGame = () => {
       arrTimer: null,
     },
   )
-  const totalLinesClearedRef = useRef(0)
   const wasRunningBeforeLevelUpRef = useRef(false)
   const chargedStrikeCounterRef = useRef(0)
   const chargedStrikeReadyRef = useRef(false)
   const steadyMindPlacementRef = useRef(0)
   const flameBurnTurnsRef = useRef(0)
-  const lastClearWasTetrisRef = useRef(false)
-  const isBackToBackRef = useRef(false)
-  const [isBackToBack, setIsBackToBack] = useState(false)
   const lastRotationWasSpinRef = useRef(false)
+  const [isBackToBack, setIsBackToBack] = useState(false)
+  const isBackToBackRef = useRef(false)
+  const [isStageCleared, setIsStageCleared] = useState(false)
+  const [pendingNextStage, setPendingNextStage] = useState<number | null>(null)
+  const autoStartNextStageRef = useRef(false)
+  const prevStageIdRef = useRef(stageId)
+  const isStageClearedRef = useRef(false)
+  const softDropTimerRef = useRef<number | null>(null)
+  const attackIntervalRef = useRef<number | null>(null)
+  const [attackCycleSeed, setAttackCycleSeed] = useState(0)
+  const [loadingProgressMs, setLoadingProgressMs] = useState(0)
+  const [loadingTelegraphActive, setLoadingTelegraphActive] = useState(false)
+  const [loadingBurstSignal, setLoadingBurstSignal] = useState<number | null>(null)
+  const loadingTimerRef = useRef<number | null>(null)
+  const loadingTelegraphRef = useRef(false)
+  const lastLoadingBeatRef = useRef<number | null>(null)
+  const loadingActiveRef = useRef(false)
+  const loadingResetTimerRef = useRef<number | null>(null)
+  const loadingStartRef = useRef(0)
 
   const replenishQueue = useCallback(() => {
     setNextQueue((prev) => {
@@ -675,6 +172,10 @@ const TetrisGame = () => {
   }, [nextQueue, upcomingPieceIndex, replenishQueue])
 
   const startGame = useCallback(() => {
+    if (softDropTimerRef.current !== null) {
+      window.clearInterval(softDropTimerRef.current)
+      softDropTimerRef.current = null
+    }
     const firstBag = createBagQueue()
     const secondBag = createBagQueue()
     const queue = [...firstBag, ...secondBag]
@@ -685,43 +186,69 @@ const TetrisGame = () => {
     setCurrentPiece(initialPiece)
     setNextQueue(queue)
     setUpcomingPieceIndex(1)
-    setLevel(0)
     setHoldPiece(null)
     setHasHeld(false)
     setIsGameOver(false)
     setIsRunning(true)
-    setMonster({ stage: 0, loop: 0, hp: getMonsterMaxHP(0, 0) })
-    setPlayerLevel(1)
-    setPlayerExp(0)
-    playerLevelRef.current = 1
-    setSkillLevels(createInitialSkillLevels())
+    setMonsterHP(stageDefinition.maxHP)
+    setPlayerLevel(initialPlayerLevel)
+    setPlayerExp(initialPlayerExp)
+    playerLevelRef.current = initialPlayerLevel
+    playerTotalExpRef.current = calculateTotalExpFromState(initialPlayerLevel, initialPlayerExp)
     setComboChain(0)
-    setPendingSkills([])
-    setIsLevelUpMenuVisible(false)
-    totalLinesClearedRef.current = 0
     wasRunningBeforeLevelUpRef.current = false
     chargedStrikeCounterRef.current = 0
     chargedStrikeReadyRef.current = false
     steadyMindPlacementRef.current = 0
     flameBurnTurnsRef.current = 0
-    lastClearWasTetrisRef.current = false
+    lastRotationWasSpinRef.current = false
     isBackToBackRef.current = false
     setIsBackToBack(false)
     setSmashSignal(null)
     setSmashBackToBack(false)
     setSmashLabel('SMASH!')
-    lastRotationWasSpinRef.current = false
-  }, [])
+    setIsStageCleared(false)
+    setPendingNextStage(null)
+    autoStartNextStageRef.current = false
+    isStageClearedRef.current = false
+    if (attackIntervalRef.current !== null) {
+      window.clearInterval(attackIntervalRef.current)
+      attackIntervalRef.current = null
+    }
+    if (loadingTimerRef.current !== null) {
+      window.clearInterval(loadingTimerRef.current)
+      loadingTimerRef.current = null
+    }
+    if (loadingResetTimerRef.current !== null) {
+      window.clearTimeout(loadingResetTimerRef.current)
+      loadingResetTimerRef.current = null
+    }
+    loadingActiveRef.current = false
+    loadingTelegraphRef.current = false
+    lastLoadingBeatRef.current = null
+    loadingStartRef.current = 0
+    setLoadingProgressMs(0)
+    setLoadingTelegraphActive(false)
+    setLoadingBurstSignal(null)
+    setAttackCycleSeed((previous) => previous + 1)
+  }, [initialPlayerExp, initialPlayerLevel, stageDefinition.maxHP])
 
   useEffect(() => {
-    if (isLevelUpMenuVisible) {
-      wasRunningBeforeLevelUpRef.current = isRunningRef.current
-      setIsRunning(false)
-    } else if (!isGameOver && wasRunningBeforeLevelUpRef.current) {
-      setIsRunning(true)
-      wasRunningBeforeLevelUpRef.current = false
+    const stageChanged = prevStageIdRef.current !== stageId
+    if (stageChanged || autoStartNextStageRef.current) {
+      prevStageIdRef.current = stageId
+      startGame()
+      autoStartNextStageRef.current = false
     }
-  }, [isLevelUpMenuVisible, isGameOver])
+  }, [stageId, startGame])
+
+  useEffect(() => {
+    prevStageIdRef.current = stageId
+  }, [stageId])
+
+  useEffect(() => {
+    isStageClearedRef.current = isStageCleared
+  }, [isStageCleared])
 
   useEffect(() => {
     if (smashSignal === null) return undefined
@@ -734,13 +261,18 @@ const TetrisGame = () => {
     return () => window.clearTimeout(timer)
   }, [smashSignal])
 
+  useEffect(() => {
+    if (loadingBurstSignal === null) return undefined
+
+    const timer = window.setTimeout(() => {
+      setLoadingBurstSignal(null)
+    }, 600)
+    return () => window.clearTimeout(timer)
+  }, [loadingBurstSignal])
+
   const dropSpeed = useMemo(() => {
-    const baseSpeed = Math.max(50, settings.gravity - level * 40)
-    if (softDropActive) {
-      return Math.max(30, baseSpeed / Math.max(settings.sdf, 1))
-    }
-    return baseSpeed
-  }, [level, softDropActive, settings.gravity, settings.sdf])
+    return Math.max(50, settings.gravity)
+  }, [settings.gravity])
 
   useEffect(() => {
     settingsRef.current = settings
@@ -763,83 +295,271 @@ const TetrisGame = () => {
   }, [playerLevel])
 
   useEffect(() => {
-    if (!isLevelUpMenuVisible) return () => {}
+    if (!skillSelectionActive) return () => {}
 
     const handleClickOutside = (event: MouseEvent) => {
       const skillMenu = document.querySelector('.tetris__skill-menu')
       if (skillMenu && !skillMenu.contains(event.target as Node)) {
-        setIsLevelUpMenuVisible(false)
+        // setIsSkillSelectionPending(false) // This line is removed
       }
     }
 
     document.addEventListener('mousedown', handleClickOutside)
     return () => document.removeEventListener('mousedown', handleClickOutside)
-  }, [isLevelUpMenuVisible])
+  }, [skillSelectionActive])
+
+  const addGarbageLines = useCallback((lines: number) => {
+    if (lines <= 0 || isStageClearedRef.current) return
+
+    let nextBoard: Board | null = null
+
+    setBoard((prevBoard) => {
+      const updated = prevBoard.slice(lines)
+      while (updated.length < BOARD_HEIGHT) {
+        const hole = Math.floor(Math.random() * BOARD_WIDTH)
+        const garbageRow = Array.from({ length: BOARD_WIDTH }, (_, x) => (x === hole ? null : '#9ca3af'))
+        updated.push(garbageRow)
+      }
+      nextBoard = updated
+      return updated
+    })
+
+    setCurrentPiece((prev) => {
+      if (!prev || !nextBoard) return prev
+
+      let adjustedPiece = prev
+      while (!canMove(adjustedPiece, nextBoard, 0, 0)) {
+        adjustedPiece = {
+          ...adjustedPiece,
+          position: {
+            ...adjustedPiece.position,
+            y: adjustedPiece.position.y - 1,
+          },
+        }
+
+        if (adjustedPiece.position.y < -4) {
+          setIsGameOver(true)
+          setIsRunning(false)
+          return null
+        }
+      }
+
+      return adjustedPiece
+    })
+  }, [])
+
+  useEffect(() => {
+    const pattern = stageDefinition.attackPattern
+
+    if (!pattern || !isRunning || isGameOver || isStageCleared) {
+      if (attackIntervalRef.current !== null) {
+        window.clearInterval(attackIntervalRef.current)
+        attackIntervalRef.current = null
+      }
+      if (loadingTimerRef.current !== null) {
+        window.clearInterval(loadingTimerRef.current)
+        loadingTimerRef.current = null
+      }
+      if (loadingResetTimerRef.current !== null) {
+        window.clearTimeout(loadingResetTimerRef.current)
+        loadingResetTimerRef.current = null
+      }
+      loadingActiveRef.current = false
+      setLoadingProgressMs(0)
+      setLoadingTelegraphActive(false)
+      loadingStartRef.current = 0
+      return undefined
+    }
+
+    if (pattern.type === 'garbageLine') {
+      if (attackIntervalRef.current !== null) {
+        window.clearInterval(attackIntervalRef.current)
+        attackIntervalRef.current = null
+      }
+
+      const interval = window.setInterval(() => {
+        if (!isRunningRef.current || isGameOverRef.current || isStageClearedRef.current) {
+          return
+        }
+        addGarbageLines(pattern.lines)
+      }, Math.max(1000, pattern.intervalMs))
+
+      attackIntervalRef.current = interval
+
+      return () => {
+        if (attackIntervalRef.current !== null) {
+          window.clearInterval(attackIntervalRef.current)
+          attackIntervalRef.current = null
+        }
+        if (loadingTimerRef.current !== null) {
+          window.clearInterval(loadingTimerRef.current)
+          loadingTimerRef.current = null
+        }
+        if (loadingResetTimerRef.current !== null) {
+          window.clearTimeout(loadingResetTimerRef.current)
+          loadingResetTimerRef.current = null
+        }
+      }
+    }
+
+    if (pattern.type === 'loadingBurst') {
+      if (attackIntervalRef.current !== null) {
+        window.clearInterval(attackIntervalRef.current)
+        attackIntervalRef.current = null
+      }
+
+      if (loadingTimerRef.current !== null) {
+        window.clearInterval(loadingTimerRef.current)
+        loadingTimerRef.current = null
+      }
+      if (loadingResetTimerRef.current !== null) {
+        window.clearTimeout(loadingResetTimerRef.current)
+        loadingResetTimerRef.current = null
+      }
+
+      loadingActiveRef.current = true
+      const firstStart = performance.now()
+      loadingStartRef.current = firstStart
+      lastLoadingBeatRef.current = firstStart
+      setLoadingProgressMs(0)
+      loadingTelegraphRef.current = false
+      setLoadingTelegraphActive(false)
+
+      const step = () => {
+        if (!isRunningRef.current || isGameOverRef.current || isStageClearedRef.current) {
+          if (loadingTimerRef.current !== null) {
+            window.clearInterval(loadingTimerRef.current)
+            loadingTimerRef.current = null
+          }
+          if (loadingResetTimerRef.current !== null) {
+            window.clearTimeout(loadingResetTimerRef.current)
+            loadingResetTimerRef.current = null
+          }
+          return
+        }
+
+        const now = performance.now()
+        const elapsed = now - loadingStartRef.current
+        setLoadingProgressMs(Math.min(elapsed, pattern.chargeMs))
+
+        const telegraphWindow = pattern.telegraphMs ?? 1000
+        if (!loadingTelegraphRef.current && elapsed >= pattern.chargeMs - telegraphWindow) {
+          loadingTelegraphRef.current = true
+          lastLoadingBeatRef.current = now
+          setLoadingTelegraphActive(true)
+        }
+
+        if (elapsed >= pattern.chargeMs) {
+          loadingActiveRef.current = false
+          loadingTelegraphRef.current = false
+          lastLoadingBeatRef.current = now
+        setLoadingProgressMs(pattern.chargeMs)
+        setLoadingTelegraphActive(false)
+        if (loadingTimerRef.current !== null) {
+          window.clearInterval(loadingTimerRef.current)
+          loadingTimerRef.current = null
+        }
+          setLoadingBurstSignal(Date.now())
+          addGarbageLines(pattern.lines)
+
+          const resetDelayId = window.setTimeout(() => {
+            if (!isRunningRef.current || isGameOverRef.current || isStageClearedRef.current) {
+              return
+            }
+            loadingActiveRef.current = true
+            const restartTime = performance.now()
+            lastLoadingBeatRef.current = restartTime
+            loadingStartRef.current = restartTime
+            setLoadingProgressMs(0)
+            loadingTelegraphRef.current = false
+            setLoadingTelegraphActive(false)
+            loadingTimerRef.current = window.setInterval(step, 50)
+          }, 600)
+          loadingResetTimerRef.current = resetDelayId
+          return
+        }
+
+        lastLoadingBeatRef.current = now
+      }
+
+      loadingTimerRef.current = window.setInterval(step, 50)
+
+      return () => {
+        if (loadingTimerRef.current !== null) {
+          window.clearInterval(loadingTimerRef.current)
+          loadingTimerRef.current = null
+        }
+        if (loadingResetTimerRef.current !== null) {
+          window.clearTimeout(loadingResetTimerRef.current)
+          loadingResetTimerRef.current = null
+        }
+      }
+    }
+
+    return undefined
+  }, [stageDefinition, isRunning, isGameOver, isStageCleared, addGarbageLines, attackCycleSeed])
 
   const dealDamageToMonster = useCallback(
     (amount: number) => {
-      if (amount <= 0) return false
+      if (amount <= 0 || isStageClearedRef.current) return false
       let defeated = false
-      setMonster((prev) => {
-        const remainingHP = prev.hp - amount
-        if (remainingHP > 0) {
-          return { ...prev, hp: remainingHP }
+      setMonsterHP((previousHP: number) => {
+        if (isStageClearedRef.current) {
+          return previousHP
+        }
+        const remaining = previousHP - amount
+        if (remaining > 0) {
+          return remaining
         }
 
         defeated = true
-        const reward = getMonsterMaxHP(prev.stage, prev.loop)
-        setPlayerExp((previousExp) => {
-          let exp = previousExp + reward
-          let level = playerLevelRef.current
-          let leveledUp = false
-          let requirement = getLevelRequirement(level)
-          while (exp >= requirement) {
-            exp -= requirement
-            level += 1
-            leveledUp = true
-            requirement = getLevelRequirement(level)
-          }
-          if (level !== playerLevelRef.current) {
-            playerLevelRef.current = level
-            setPlayerLevel(level)
-          }
+        isStageClearedRef.current = true
+        setIsStageCleared(true)
+        setIsRunning(false)
+        setPendingNextStage(stageId + 1 <= totalStages ? stageId + 1 : null)
+
+        const reward = stageDefinition.expReward
+        const totalExpBefore = playerTotalExpRef.current
+        const totalExpAfter = totalExpBefore + reward
+        const resolved = resolveLevelFromTotalExp(totalExpAfter)
+        const leveledUp = resolved.level > playerLevelRef.current
+
+        playerTotalExpRef.current = totalExpAfter
+        playerLevelRef.current = resolved.level
+        setPlayerLevel(resolved.level)
+        setPlayerExp(resolved.exp)
+
           if (leveledUp) {
+          wasRunningBeforeLevelUpRef.current = false
+          setIsRunning(false)
             const availableSkills = SKILL_DEFINITIONS.map((definition) => definition.id)
             const shuffled = availableSkills.sort(() => Math.random() - 0.5)
-            setPendingSkills(shuffled.slice(0, 3))
-            setIsLevelUpMenuVisible(true)
-          }
-          setComboChain(0)
-          return exp
-        })
+          const pendingSkills = shuffled.slice(0, 3)
+          onRequestSkillSelection(pendingSkills)
+          onPlayerProgress(resolved.level, resolved.exp, pendingSkills)
+          onStageCleared(stageId, resolved.level, resolved.exp, pendingSkills)
+        } else {
+          onPlayerProgress(resolved.level, resolved.exp)
+          onStageCleared(stageId, resolved.level, resolved.exp)
+        }
 
-        const totalMonsters = MONSTER_DATA.length
-        const nextStage = (prev.stage + 1) % totalMonsters
-        const nextLoop = nextStage === 0 ? prev.loop + 1 : prev.loop
-        flameBurnTurnsRef.current = 0
-        return { stage: nextStage, loop: nextLoop, hp: getMonsterMaxHP(nextStage, nextLoop) }
+        return 0
       })
       return defeated
     },
-    [],
+    [onPlayerProgress, onStageCleared, onRequestSkillSelection, stageDefinition.expReward, stageId, totalStages],
   )
 
   const updateBackToBackState = useCallback(
-    (isTetris: boolean) => {
-      if (isTetris) {
-        if (lastClearWasTetrisRef.current) {
-          if (!isBackToBackRef.current) {
-            isBackToBackRef.current = true
-            setIsBackToBack(true)
-          }
-        }
-        lastClearWasTetrisRef.current = true
-      } else {
-        lastClearWasTetrisRef.current = false
+    (isTetrisLike: boolean) => {
+      if (isTetrisLike) {
         if (isBackToBackRef.current) {
-          isBackToBackRef.current = false
-          setIsBackToBack(false)
+          setIsBackToBack(true)
         }
+        isBackToBackRef.current = true
+      } else if (isBackToBackRef.current) {
+        isBackToBackRef.current = false
+        setIsBackToBack(false)
       }
     },
     [],
@@ -853,68 +573,51 @@ const TetrisGame = () => {
       setBoard(clearedBoard)
 
       if (clearedLines > 0) {
-        const nextCombo = comboChain + 1
-        setComboChain(nextCombo)
-        totalLinesClearedRef.current += clearedLines
-        setLevel(Math.floor(totalLinesClearedRef.current / LINES_PER_LEVEL))
-        const damageTable = [0, 1, 2, 3, 6]
-        let damage = damageTable[clearedLines] ?? 0
-        damage += skillLevels.flatAttack
-        if (clearedLines === 1) {
-          damage += skillLevels.singleLineBonus
-        } else if (clearedLines === 4) {
-          damage += skillLevels.tetrisBonus * 2
-        }
-        if (nextCombo > 1 && skillLevels.comboBonus > 0) {
-          damage += nextCombo * skillLevels.comboBonus
-        }
-
         const tSpinType = getTSpinType(board, piece, lastRotationWasSpinRef.current, clearedLines)
         lastRotationWasSpinRef.current = false
 
+        const battleResult = calculateDamage(
+          {
+            clearedLines,
+            comboChain,
+            isBackToBack: isBackToBackRef.current,
+            tSpinType,
+          },
+          skillLevels,
+        )
+
+        const isTetrisLike = tSpinType !== 'none' || clearedLines === 4
+        const wasBackToBack = isBackToBackRef.current
+
+        setComboChain(battleResult.comboChain)
+        updateBackToBackState(isTetrisLike)
+
+        isBackToBackRef.current = battleResult.isBackToBack
+        setIsBackToBack(battleResult.isBackToBack)
+
         if (tSpinType !== 'none') {
-          updateBackToBackState(true)
-          let tSpinDamage = 0
-          let label = 'T-SPIN'
-          switch (tSpinType) {
-            case 'mini':
-              tSpinDamage = 2 + Math.max(0, clearedLines - 1)
-              label = clearedLines === 1 ? 'T-SPIN MINI!' : 'T-SPIN MINI CLEAR!'
-              break
-            case 'double':
-              tSpinDamage = 6
-              label = 'T-SPIN DOUBLE!'
-              break
-            case 'triple':
-              tSpinDamage = 9
-              label = 'T-SPIN TRIPLE!'
-              break
-            default:
-              break
-          }
-          damage += tSpinDamage
-          if (isBackToBackRef.current) {
-            damage += BACK_TO_BACK_BONUS_DAMAGE
-          }
-          setSmashBackToBack(isBackToBackRef.current)
+          const label =
+            tSpinType === 'mini'
+              ? clearedLines === 1
+                ? 'T-SPIN MINI!'
+                : 'T-SPIN MINI CLEAR!'
+              : tSpinType === 'double'
+                ? 'T-SPIN DOUBLE!'
+                : 'T-SPIN TRIPLE!'
           setSmashLabel(label)
+          setSmashBackToBack(wasBackToBack)
           setSmashSignal(Date.now())
         } else if (clearedLines === 4) {
-          updateBackToBackState(true)
-          if (isBackToBackRef.current) {
-            damage += BACK_TO_BACK_BONUS_DAMAGE
-          }
-          setSmashBackToBack(isBackToBackRef.current)
           setSmashLabel('SMASH!')
+          setSmashBackToBack(wasBackToBack)
           setSmashSignal(Date.now())
-        } else {
-          updateBackToBackState(false)
+          } else {
           setSmashBackToBack(false)
         }
 
         if (skillLevels.chargedStrike > 0) {
           if (chargedStrikeReadyRef.current) {
-            damage += 3 * skillLevels.chargedStrike
+            battleResult.damage += 3 * skillLevels.chargedStrike
             chargedStrikeReadyRef.current = false
           }
           if (clearedLines === 1) {
@@ -932,15 +635,22 @@ const TetrisGame = () => {
         }
 
         if (skillLevels.flameStrike > 0 && flameBurnTurnsRef.current > 0) {
-          damage += 3 * skillLevels.flameStrike
+          battleResult.damage += 3 * skillLevels.flameStrike
           flameBurnTurnsRef.current -= 1
         }
 
-        if (damage > 0) {
-          const defeated = dealDamageToMonster(damage)
+        if (battleResult.damage > 0) {
+          const defeated = dealDamageToMonster(battleResult.damage)
           if (skillLevels.flameStrike > 0) {
             flameBurnTurnsRef.current = defeated ? 0 : 2 * skillLevels.flameStrike
           }
+          gameEventBus.emit('linesCleared', {
+            clearedLines,
+            tSpinType,
+            comboChain: battleResult.comboChain,
+            backToBack: wasBackToBack,
+            damage: battleResult.damage,
+          })
         }
       } else {
         setComboChain(0)
@@ -955,20 +665,23 @@ const TetrisGame = () => {
         currentPieceRef.current = freshPiece
         setHasHeld(false)
         steadyMindPlacementRef.current += 1
-        if (skillLevels.steadyMind > 0 && steadyMindPlacementRef.current >= 5) {
-          dealDamageToMonster(3 * skillLevels.steadyMind)
+        const currentSkillsAfterPlacement = skillLevels
+        if (currentSkillsAfterPlacement.steadyMind > 0 && steadyMindPlacementRef.current >= 5) {
+          dealDamageToMonster(3 * currentSkillsAfterPlacement.steadyMind)
           steadyMindPlacementRef.current = 0
         }
       } else {
         setCurrentPiece(null)
         currentPieceRef.current = null
         setIsRunning(false)
+        if (!isStageCleared) {
         setIsGameOver(true)
+        }
       }
       window.clearTimeout(lockTimerRef.current ?? undefined)
       lockTimerRef.current = null
     },
-    [board, comboChain, dealDamageToMonster, getNextPieceType, skillLevels, updateBackToBackState],
+    [board, comboChain, dealDamageToMonster, getNextPieceType, skillLevels, updateBackToBackState, stageDefinition.maxHP],
   )
 
   const movePiece = useCallback(
@@ -1055,38 +768,13 @@ const TetrisGame = () => {
 
     lockPiece(ghostPiece)
     lastRotationWasSpinRef.current = false
-  }, [board, currentPiece, isRunning, level, lockPiece])
+  }, [board, currentPiece, isRunning, lockPiece])
 
   useEffect(() => {
     hardDropRef.current = hardDrop
   }, [hardDrop])
 
-  const getKickTests = (type: TetrominoType, rotationDelta: number, clockwise: boolean): KickTest[] => {
-    if (!currentPiece) {
-      return clockwise ? KICK_TABLE_STANDARD : KICK_TABLE_STANDARD_CCW
-    }
-
-    const currentRotation = currentPiece.rotationIndex
-    const targetRotation = (currentRotation + rotationDelta + 4) % 4
-    const key = `${currentRotation}>${targetRotation}`
-
-    if (rotationDelta === 2) {
-      return SRS_KICKS[type][key] ?? KICK_TABLE_180
-    }
-
-    const table = SRS_KICKS[type][key]
-    if (table) {
-      return table
-    }
-
-    if (type === 'I') {
-      return clockwise ? KICK_TABLE_I : KICK_TABLE_I_CCW
-    }
-
-    return clockwise ? KICK_TABLE_STANDARD : KICK_TABLE_STANDARD_CCW
-  }
-
-  const attemptRotation = useCallback(
+  const performRotation = useCallback(
     (rotationChange: number) => {
       if (!currentPiece || !isRunning) return
 
@@ -1094,30 +782,10 @@ const TetrisGame = () => {
         return
       }
 
-      const newRotation = (currentPiece.rotationIndex + rotationChange + 4) % 4
-      const clockwise = rotationChange > 0
-      const kickTests = getKickTests(currentPiece.type, Math.abs(rotationChange), clockwise)
-      for (const test of kickTests) {
-        const offsetX = test.x
-        const offsetY = test.y
-        const adjustedPiece: ActivePiece = {
-          ...currentPiece,
-          rotationIndex: newRotation,
-          position: {
-            x: currentPiece.position.x + offsetX,
-            y: currentPiece.position.y + offsetY,
-          },
-        }
-
-        if (canMove(adjustedPiece, board, 0, 0)) {
-          const newPiece: ActivePiece = {
-            ...adjustedPiece,
-            rotationIndex: newRotation,
-          }
-          setCurrentPiece(newPiece)
-          lastRotationWasSpinRef.current = rotationChange !== 0
-          return
-        }
+      const result = applyRotation(currentPiece, board, rotationChange)
+      if (result.piece) {
+        setCurrentPiece(result.piece)
+        lastRotationWasSpinRef.current = result.wasRotated
       }
     },
     [board, currentPiece, isRunning],
@@ -1133,16 +801,16 @@ const TetrisGame = () => {
   }, [togglePause])
 
   const rotateClockwise = useCallback(() => {
-    attemptRotation(1)
-  }, [attemptRotation])
+    performRotation(1)
+  }, [performRotation])
 
   const rotateCounterClockwise = useCallback(() => {
-    attemptRotation(-1)
-  }, [attemptRotation])
+    performRotation(-1)
+  }, [performRotation])
 
   const rotate180 = useCallback(() => {
-    attemptRotation(2)
-  }, [attemptRotation])
+    performRotation(2)
+  }, [performRotation])
 
   useEffect(() => {
     rotateClockwiseRef.current = rotateClockwise
@@ -1304,12 +972,7 @@ const TetrisGame = () => {
         }
         return
       }
-      if (isLevelUpMenuVisible) {
-        if (loweredKey === 'r') {
-          restartGameRef.current()
-        } else if (!isGameOverRef.current && loweredKey === 'p') {
-          togglePauseRef.current()
-        }
+      if (skillSelectionActive) {
         return
       }
 
@@ -1325,8 +988,13 @@ const TetrisGame = () => {
           }
           break
         case 'ArrowDown':
-          setSoftDropActive(true)
+          if (softDropTimerRef.current === null) {
           movePieceRef.current(0, 1)
+            const interval = Math.max(16, settingsRef.current.sdf)
+            softDropTimerRef.current = window.setInterval(() => {
+              movePieceRef.current(0, 1)
+            }, interval)
+          }
           break
         case 'ArrowUp':
         case 'x':
@@ -1375,7 +1043,10 @@ const TetrisGame = () => {
       }
 
       if (event.key === 'ArrowDown') {
-        setSoftDropActive(false)
+        if (softDropTimerRef.current !== null) {
+          window.clearInterval(softDropTimerRef.current)
+          softDropTimerRef.current = null
+        }
       }
     }
 
@@ -1397,7 +1068,7 @@ const TetrisGame = () => {
       state.direction = 0
       directionalKeysRef.current.clear()
     }
-  }, [handleDirectionKeyDown, handleDirectionKeyUp, isLevelUpMenuVisible])
+  }, [handleDirectionKeyDown, handleDirectionKeyUp, skillSelectionActive])
 
   useEffect(() => {
     if (!currentPiece && !isGameOver && isRunning) {
@@ -1476,8 +1147,6 @@ const TetrisGame = () => {
 
   const getPieceMatrix = (type: TetrominoType) => getRotationMatrix(type, 0)
 
-  const isReady = !!currentPiece && !isGameOver
-
   return (
     <div className="tetris">
       <aside className="tetris__panel tetris__panel--mini" aria-live="polite">
@@ -1499,41 +1168,6 @@ const TetrisGame = () => {
             <p className="tetris__hint">尚未暫存</p>
           )}
         </div>
-
-        {isLevelUpMenuVisible && (
-          <div className="tetris__skill-menu" role="dialog" aria-modal="true">
-            <h3 className="tetris__skill-title">升級！選擇一項技能</h3>
-            <ul className="tetris__skill-options">
-              {pendingSkills.map((skillId) => {
-                const definition = SKILL_DEFINITIONS.find((skill) => skill.id === skillId)
-                if (!definition) return null
-                const level = skillLevels[skillId]
-                return (
-                  <li key={skillId}>
-                    <button
-                      type="button"
-                      className="tetris__skill-button"
-                      onClick={() => {
-                        setSkillLevels((prev) => ({ ...prev, [skillId]: prev[skillId] + 1 }))
-                        setIsLevelUpMenuVisible(false)
-                        if (wasRunningBeforeLevelUpRef.current && !isGameOver) {
-                          setIsRunning(true)
-                          wasRunningBeforeLevelUpRef.current = false
-                        }
-                      }}
-                    >
-                      <span className="tetris__skill-name">
-                        {definition.name}
-                        {level > 0 ? ` Lv.${level + 1}` : ''}
-                      </span>
-                      <span className="tetris__skill-desc">{definition.description}</span>
-                    </button>
-                  </li>
-                )
-              })}
-            </ul>
-          </div>
-        )}
       </aside>
 
       <div className="tetris__main">
@@ -1561,54 +1195,127 @@ const TetrisGame = () => {
               {smashBackToBack && <span className="tetris__smash-sub">BTB</span>}
             </div>
           )}
-          {!isRunning && !isGameOver && (
-            <div className="tetris__overlay">
-              <p>{currentPiece ? '按下「繼續」或 P 鍵繼續遊戲' : '按下「開始遊戲」或 R 鍵開始'}</p>
+          {isStageCleared && (
+            <div className="tetris__overlay tetris__overlay--cleared">
+              <p>關卡完成！獲得 {stageDefinition.expReward} 經驗值</p>
+              {pendingNextStage ? (
+                <>
+                  <p>是否前往下一關：第 {pendingNextStage} 關？</p>
+                  <div className="tetris__overlay-actions">
+                    <button
+                      type="button"
+                      className="tetris__overlay-button"
+                      onClick={() => {
+                        autoStartNextStageRef.current = true
+                        onRequestNextStage(pendingNextStage)
+                      }}
+                    >
+                      挑戰下一關
+                    </button>
+                    <button
+                      type="button"
+                      className="tetris__overlay-button"
+                      onClick={() => {
+                        startGame()
+                      }}
+                    >
+                      再次挑戰本關
+                    </button>
+                  </div>
+                </>
+              ) : (
+                <>
+                  <p>已通過所有關卡，是否再次挑戰本關？</p>
+                  <div className="tetris__overlay-actions">
+                    <button
+                      type="button"
+                      className="tetris__overlay-button"
+                      onClick={() => {
+                        startGame()
+                      }}
+                    >
+                      再次挑戰本關
+                    </button>
+                  </div>
+                </>
+              )}
             </div>
           )}
-          {isGameOver && (
+          {!isRunning && !isGameOver && !isStageCleared && (
+            <div className="tetris__overlay">
+              <p>{currentPiece ? '按下「繼續」或 P 鍵繼續遊戲' : '按下「重新挑戰」或 R 鍵重新挑戰'}</p>
+            </div>
+          )}
+          {isGameOver && !isStageCleared && (
             <div className="tetris__overlay">
               <p>遊戲結束</p>
-              <p>按下「重新開始」或 R 鍵重新挑戰</p>
+              <p>按下「重新挑戰」或 R 鍵重新挑戰</p>
             </div>
           )}
         </div>
 
         {(() => {
-          const currentMonster = MONSTER_DATA[monster.stage]
-          const stageNumber = monster.loop * MONSTER_DATA.length + monster.stage + 1
-          const currentMaxHP = getMonsterMaxHP(monster.stage, monster.loop)
-          const displayName = `${currentMonster.name}${monster.loop > 0 ? '+'.repeat(monster.loop) : ''}`
+          const currentStage = stageDefinition
           const monsterStyle = {
-            '--monster-color': currentMonster.color,
-            '--monster-accent': currentMonster.accent,
+            '--monster-color': currentStage.color,
+            '--monster-accent': currentStage.accent,
           } as CSSProperties
+          const healthPercent = Math.max(0, Math.min(100, (monsterHP / currentStage.maxHP) * 100))
 
           return (
             <div className="tetris__monster" style={monsterStyle}>
-              <div className="tetris__monster-header">第 {stageNumber} 關 {displayName}</div>
+              <div className="tetris__monster-header">
+                第 {stageId} 關 · {currentStage.title}
+              </div>
               <div className="tetris__monster-body">
-                <div className={`tetris__monster-avatar tetris__monster-avatar--${currentMonster.figure}`} />
+                <div className="tetris__monster-avatar" aria-hidden="true">
+                  <img src={currentStage.image} alt="" />
+                </div>
                 <div className="tetris__monster-health">
                   <div className="tetris__monster-health-bar">
-                    <div
-                      className="tetris__monster-health-bar-inner"
-                      style={{ width: `${(monster.hp / currentMaxHP) * 100}%` }}
-                    />
+                    <div className="tetris__monster-health-bar-inner" style={{ width: `${healthPercent}%` }} />
                   </div>
                   <span className="tetris__monster-health-text">
-                    {monster.hp} / {currentMaxHP}
+                    {monsterHP} / {currentStage.maxHP}
                   </span>
+                  <span className="tetris__monster-health-text">{currentStage.monsterName}</span>
                 </div>
               </div>
-              <div className={`tetris__monster-figure tetris__monster-figure--${currentMonster.figure}`}>
-                <div className="tetris__monster-figure-core">
-                  <div className="tetris__monster-figure-face">
-                    <div className="tetris__monster-figure-eye tetris__monster-figure-eye--left" />
-                    <div className="tetris__monster-figure-eye tetris__monster-figure-eye--right" />
+              {currentStage.description && <p className="tetris__monster-description">{currentStage.description}</p>}
+              {stageDefinition.attackPattern?.type === 'loadingBurst' &&
+                (() => {
+                  const pattern = stageDefinition.attackPattern
+                  if (!pattern || pattern.type !== 'loadingBurst') {
+                    return null
+                  }
+
+                  const progressRatio = Math.min(1, Math.max(0, loadingProgressMs / pattern.chargeMs))
+                  const remainingSeconds = Math.max(0, Math.ceil((pattern.chargeMs - loadingProgressMs) / 1000))
+
+                  return (
+                    <div
+                      className={`tetris__monster-loading${loadingTelegraphActive ? ' tetris__monster-loading-telegraph' : ''}`}
+                    >
+                      <div className="tetris__monster-loading-title">Loading Attack</div>
+                      <div className="tetris__monster-loading-bar">
+                        <div
+                          className="tetris__monster-loading-bar-inner"
+                          style={{ transform: `scaleX(${progressRatio})` }}
+                        />
                   </div>
+                      <div className="tetris__monster-loading-tooltip">
+                        <span>{loadingTelegraphActive ? '即將攻擊！' : '蓄力中…'}</span>
+                        <span>
+                          {remainingSeconds}
+                          {' 秒 · '}
+                          {pattern.lines}
+                          {' 列垃圾行'}
+                        </span>
                 </div>
               </div>
+                  )
+                })()}
+              {loadingBurstSignal !== null && <div className="tetris__loading-attack">攻擊</div>}
             </div>
           )
         })()}
@@ -1643,8 +1350,9 @@ const TetrisGame = () => {
           <p>職業：戰士</p>
           <p>等級：{playerLevel}</p>
           <p>經驗：{playerExp} / {getLevelRequirement(playerLevel)}</p>
-          <p>狀態：{isGameOver ? '結束' : isRunning ? '進行中' : '暫停'}</p>
+          <p>關卡狀態：{isStageCleared ? '已破關' : monsterHP > 0 ? '戰鬥中' : '待破關'}</p>
           <p>BTB：{isBackToBack ? '連續加成中' : '未啟動'}</p>
+          {skillSelectionActive && <p>技能提示：請前往技能頁面選擇升級</p>}
         </section>
 
         <section className="tetris__panel">
@@ -1705,14 +1413,14 @@ const TetrisGame = () => {
         </section>
 
         <div className="tetris__actions">
-          <button type="button" onClick={startGame} disabled={isRunning && isReady}>
-            {isRunning && isReady ? '遊戲進行中' : '開始遊戲'}
+          <button type="button" onClick={startGame} disabled={isRunning && !!currentPiece && !isStageCleared}>
+            {isRunning && currentPiece && !isStageCleared ? '戰鬥中' : '重新挑戰'}
           </button>
-          <button type="button" onClick={togglePause} disabled={!isReady}>
+          <button type="button" onClick={togglePause} disabled={!currentPiece || isStageCleared || isGameOver}>
             {isRunning ? '暫停' : '繼續'}
           </button>
-          <button type="button" onClick={restartGame}>
-            重新開始
+          <button type="button" onClick={onExitStage}>
+            返回關卡選單
           </button>
         </div>
       </aside>
